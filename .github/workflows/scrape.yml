@@ -12,7 +12,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -46,3 +46,13 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
           MAX_PRODUCTS: ${{ github.event.inputs.max_products || '0' }}
         run: python scraper.py
+
+      # Excel téléchargeable depuis la page du lancement (onglet Actions), même sans mail
+      - name: Rapport Excel
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapport-carrefour
+          path: carrefour_*.xlsx
+          retention-days: 30
+          if-no-files-found: ignore

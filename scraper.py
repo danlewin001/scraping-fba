@@ -77,7 +77,8 @@ DATA_DIR = Path("data")
 PREV_FILE = DATA_DIR / "previous.csv"
 OUT_XLSX = Path(f"carrefour_{date.today().isoformat()}.xlsx")
 
-CONCURRENCY = int(os.getenv("CONCURRENCY", "8"))
+# Sans proxy : une seule IP, donc on va doucement (2 pages à la fois) pour éviter le blocage
+CONCURRENCY = int(os.getenv("CONCURRENCY") or (8 if os.getenv("PROXY_HOST") else 2))
 MAX_PRODUCTS = int(os.getenv("MAX_PRODUCTS", "0")) or None
 
 
