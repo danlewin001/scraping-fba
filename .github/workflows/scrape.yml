@@ -1,0 +1,48 @@
+name: Scraping Carrefour.be
+
+on:
+  schedule:
+    - cron: "37 4 * * 1"   # chaque lundi vers 5h37 (heure de Bruxelles en hiver)
+  workflow_dispatch:        # bouton « Run workflow » pour lancer à la main
+    inputs:
+      max_products:
+        description: "Test : nombre max de produits (0 = tout)"
+        default: "0"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer les dépendances
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      # Récupère les données de la semaine passée (stockage privé, non visible publiquement)
+      - name: Données semaine passée
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: carrefour-data-${{ github.run_id }}
+          restore-keys: carrefour-data-
+
+      - name: Scraper
+        env:
+          PROXY_HOST: ${{ secrets.PROXY_HOST }}
+          PROXY_PORT: ${{ secrets.PROXY_PORT }}
+          PROXY_USER: ${{ secrets.PROXY_USER }}
+          PROXY_PASS: ${{ secrets.PROXY_PASS }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MAX_PRODUCTS: ${{ github.event.inputs.max_products || '0' }}
+        run: python scraper.py
