@@ -411,6 +411,9 @@ async def main():
         await browser.close()
 
     print("3/3 Rapport…")
+    if not rows:
+        sys.exit(f"Carrefour a bloqué la lecture des fiches ({errors} refus HTTP 403). "
+                 "Il faut un proxy (IPRoyal) ou lancer depuis une connexion résidentielle.")
     df = pd.DataFrame(rows).drop_duplicates("id")
     n_promo, n_multi, n_baisse, n_new = build_report(df)
     summary = (
