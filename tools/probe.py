@@ -26,8 +26,8 @@ async def main():
         html = await page.content()
         print("TAILLE HTML", len(html))
         print("TITRE", await page.title())
-    if len(html) < 5000:
-        print("HTML:", html.replace("\n", " "))
+        if len(html) < 20000:
+            print("HTML:", re.sub(r"\s+", " ", html)[:3000])
         for m in re.finditer(r'.{0,80}(gtin\d*|\bean\b|barcode|eancode|ean13).{0,80}', html, re.I):
             print("MOTCLE:", m.group(0).replace("\n", " "))
         for blk in re.findall(r'<script[^>]+ld\+json[^>]*>(.*?)</script>', html, re.S):
