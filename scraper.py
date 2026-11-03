@@ -24,7 +24,13 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlencode, parse_qsl, urlunparse
 
 import pandas as pd
+import requests
+from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+
+# Firecrawl (service anti-bot dans le cloud) : utilisé si la clé est présente
+FIRECRAWL_KEY = os.getenv("FIRECRAWL_API_KEY")
+FIRECRAWL_URL = "https://api.firecrawl.dev/v1/scrape"
 
 BASE = "https://www.carrefour.be"
 
@@ -78,7 +84,8 @@ PREV_FILE = DATA_DIR / "previous.csv"
 OUT_XLSX = Path(f"carrefour_{date.today().isoformat()}.xlsx")
 
 # Sans proxy : une seule IP, donc on va doucement (2 pages à la fois) pour éviter le blocage
-CONCURRENCY = int(os.getenv("CONCURRENCY") or (8 if os.getenv("PROXY_HOST") else 2))
+CONCURRENCY = int(os.getenv("CONCURRENCY") or
+                  (2 if FIRECRAWL_KEY else 8 if os.getenv("PROXY_HOST") else 2))
 MAX_PRODUCTS = int(os.getenv("MAX_PRODUCTS", "0")) or None
 
 
@@ -217,41 +224,75 @@ def finalize_effective(row):
         row["prix_unitaire_effectif"] = prix
 
 
-TILE_JS = r"""
-() => {
-  const out = {};
-  for (const a of document.querySelectorAll('a[href]')) {
-    let href;
-    try { href = new URL(a.href, location.origin).pathname; } catch { continue; }
-    if (!/^\/fr\/[^/]+\/\d{6,10}\.html$/.test(href)) continue;
-    // remonte jusqu'à la tuile produit pour lire le badge de réduction
-    // texte de la tuile (badge -XX%, « 1+1 gratuit »…), sans déborder sur les tuiles voisines
-    let tile = a, txt = '';
-    for (let i = 0; i < 6 && tile.parentElement; i++) {
-      const up = tile.parentElement;
-      const n = up.querySelectorAll('a[href$=".html"]').length;
-      if (n > 3) break;
-      tile = up;
-    }
-    txt = (tile.innerText || '').replace(/\s+/g, ' ').slice(0, 400);
-    if (!(href in out) || txt.length > (out[href] || '').length) out[href] = txt;
-  }
-  const cats = [...document.querySelectorAll('a[href]')]
-    .map(a => { try { return new URL(a.href, location.origin).pathname; } catch { return null; } })
-    .filter(Boolean);
-  return {products: out, links: [...new Set(cats)]};
-}
-"""
 
+
+
+
+def extract_tiles(html):
+    """Depuis une page rayon : {chemin_produit: texte de la tuile} + liens vers d'autres rayons."""
+    soup = BeautifulSoup(html, "html.parser")
+    products, links = {}, set()
+    for a in soup.find_all("a", href=True):
+        path = urlparse(urljoin(BASE, a["href"])).path
+        if not PRODUCT_URL_RE.match(path):
+            links.add(path)
+            continue
+        tile = a
+        for _ in range(6):
+            up = tile.parent
+            if up is None or len([x for x in up.find_all("a", href=True)
+                                  if x["href"].endswith(".html")]) > 3:
+                break
+            tile = up
+        txt = re.sub(r"\s+", " ", tile.get_text(" ")).strip()[:400]
+        if len(txt) > len(products.get(path, "")):
+            products[path] = txt
+    return {"products": products, "links": sorted(links)}
+
+
+class PlaywrightFetcher:
+    """Vrai navigateur (Chromium), éventuellement via le proxy."""
+    def __init__(self, context):
+        self.context = context
+
+    async def get(self, url):
+        page = await self.context.new_page()
+        try:
+            resp = await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            await page.wait_for_timeout(1500)
+            return (resp.status if resp else 0), await page.content()
+        finally:
+            await page.close()
+
+
+class FirecrawlFetcher:
+    """Firecrawl ouvre la page sur ses serveurs et gère l'anti-bot."""
+    async def get(self, url):
+        body = {"url": url, "formats": ["rawHtml"], "proxy": "auto",
+                "waitFor": 1500, "blockAds": True,
+                "location": {"country": "BE", "languages": ["fr-BE"]}}
+        for attempt in range(5):
+            r = await asyncio.to_thread(
+                requests.post, FIRECRAWL_URL, json=body, timeout=120,
+                headers={"Authorization": f"Bearer {FIRECRAWL_KEY}"})
+            if r.status_code == 429:          # limite de débit (plan gratuit : 10/min)
+                await asyncio.sleep(15 * (attempt + 1))
+                continue
+            if r.status_code in (401, 402, 403):
+                raise SystemExit(f"Firecrawl refuse la requête (HTTP {r.status_code}) : "
+                                 "clé API invalide ou crédits épuisés.")
+            data = (r.json() or {}).get("data") or {}
+            status = (data.get("metadata") or {}).get("statusCode") or r.status_code
+            return status, data.get("rawHtml") or data.get("html") or ""
+        return 429, ""
 
 # ---------------------------------------------------------------- crawl
 
-async def crawl_listings(context):
+async def crawl_listings(fetcher):
     """Parcourt les pages rayons (+ pagination) et retourne
     {chemin_produit: % réduction vu sur la tuile}."""
     products, seen_cats = {}, set()
     queue = list(dict.fromkeys(START_PATHS))
-    page = await context.new_page()
     missing = []
 
     while queue:
@@ -263,8 +304,9 @@ async def crawl_listings(context):
         while True:
             url = BASE + path if p == 1 else with_params(BASE + path, p=p)
             try:
-                resp = await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                status = resp.status if resp else 0
+                status, html = await fetcher.get(url)
+            except SystemExit:
+                raise
             except Exception as e:
                 print(f"  ✗ {url} : {e}")
                 break
@@ -273,8 +315,7 @@ async def crawl_listings(context):
                 if p == 1:
                     missing.append(f"{path} (HTTP {status})")
                 break
-            await page.wait_for_timeout(1500)
-            res = await page.evaluate(TILE_JS)
+            res = extract_tiles(html)
             new = {k: v for k, v in res["products"].items() if k not in products}
             for k, v in res["products"].items():
                 if v or k not in products:
@@ -293,31 +334,28 @@ async def crawl_listings(context):
         if MAX_PRODUCTS and len(products) >= MAX_PRODUCTS:
             break
 
-    await page.close()
     return products, missing
 
 
-async def fetch_products(context, paths, tile_pct):
+async def fetch_products(fetcher, paths, tile_pct):
     sem = asyncio.Semaphore(CONCURRENCY)
     rows, errors = [], 0
 
     async def one(path):
         nonlocal errors
         async with sem:
-            page = await context.new_page()
             try:
-                resp = await page.goto(BASE + path, wait_until="domcontentloaded", timeout=45000)
-                if resp and resp.status >= 400:
-                    raise RuntimeError(f"HTTP {resp.status}")
-                html = await page.content()
+                status, html = await fetcher.get(BASE + path)
+                if status >= 400 or not html:
+                    raise RuntimeError(f"HTTP {status}")
                 row = parse_product_html(html, BASE + path)
                 apply_tile(row, tile_pct.get(path) or "")
                 rows.append(row)
+            except SystemExit:
+                raise
             except Exception as e:
                 errors += 1
                 print(f"  ✗ {path} : {e}")
-            finally:
-                await page.close()
             await polite_pause()
 
     await asyncio.gather(*(one(p) for p in paths))
@@ -398,8 +436,15 @@ async def main():
             re.compile(r".*\.(png|jpe?g|webp|gif|svg|woff2?|ttf|mp4|ico)(\?.*)?$"),
             lambda r: r.abort())
 
+        if FIRECRAWL_KEY:
+            print("Mode Firecrawl (anti-bot géré dans le cloud)")
+            fetcher = FirecrawlFetcher()
+        else:
+            print("Mode navigateur" + (" + proxy" if os.getenv("PROXY_HOST") else " direct"))
+            fetcher = PlaywrightFetcher(context)
+
         print("1/3 Parcours des rayons…")
-        tile_pct, missing = await crawl_listings(context)
+        tile_pct, missing = await crawl_listings(fetcher)
         paths = list(tile_pct)[:MAX_PRODUCTS] if MAX_PRODUCTS else list(tile_pct)
         print(f"   → {len(paths)} produits trouvés")
         if not paths:
@@ -407,13 +452,13 @@ async def main():
             sys.exit("Aucun produit trouvé : site bloqué ou structure changée.")
 
         print("2/3 Lecture des fiches produits…")
-        rows, errors = await fetch_products(context, paths, tile_pct)
+        rows, errors = await fetch_products(fetcher, paths, tile_pct)
         await browser.close()
 
     print("3/3 Rapport…")
     if not rows:
         sys.exit(f"Carrefour a bloqué la lecture des fiches ({errors} refus HTTP 403). "
-                 "Il faut un proxy (IPRoyal) ou lancer depuis une connexion résidentielle.")
+                 "Il faut Firecrawl, un proxy (IPRoyal) ou une connexion résidentielle.")
     df = pd.DataFrame(rows).drop_duplicates("id")
     n_promo, n_multi, n_baisse, n_new = build_report(df)
     summary = (

@@ -22,6 +22,10 @@ proxy résidentiel belge IPRoyal, puis t'envoie un Excel par mail.
   `.github/workflows/scrape.yml`, puis coller le contenu du fichier.
 
 ### 2. Ajouter les secrets
+
+**Option A — Firecrawl (recommandé pour les sites protégés)** : un seul secret `FIRECRAWL_API_KEY` (clé de firecrawl.dev). S'il est présent, il est utilisé à la place du proxy.
+
+**Option B — Proxy résidentiel** :
 **Settings → Secrets and variables → Actions → New repository secret** :
 
 | Nom | Valeur |
